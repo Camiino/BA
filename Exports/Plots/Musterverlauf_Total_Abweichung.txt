@@ -1,0 +1,2 @@
+TOTAL over clusters (mean of cluster means): 19.659%
+TOTAL over all entries (mean across kreis+zikzak): 19.659%

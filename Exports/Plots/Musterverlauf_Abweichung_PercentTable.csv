@@ -1,0 +1,15 @@
+cluster,abweichung_percent
+AlterOnly/18-20,13.412485210302227
+AlterOnly/21-25,20.746779811078028
+AlterOnly/25-35,20.820097729134382
+AlterOnly/35+,20.687042729284492
+AlterWithinGender/Männlich_18-20,13.076193183867323
+AlterWithinGender/Männlich_21-25,21.313992503987155
+AlterWithinGender/Männlich_25-35,20.886761637098
+AlterWithinGender/Weiblich_21-25,19.564966886330502
+AlterWithinGender/Weiblich_25-35,20.751039109376258
+AlterWithinGender/Weiblich_35+,25.94296512943896
+Geschlecht/Männlich,19.762112544870654
+Geschlecht/Weiblich,18.940302253613613
+TOTAL (over clusters),19.658728227365135
+TOTAL (over all entries),19.658728227365135

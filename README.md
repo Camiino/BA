@@ -42,6 +42,24 @@ Key scripts and their outputs (in order of execution):
 - `Step9_Segmentation.py` -> `Exports/Clustered/...`
 - `visualize_marker_trajectories.py` -> ad-hoc 3D marker animation from any CSV.
 
+- `Step10_musterverlauf_analysis.py` -> compares averaged XY-trajectories against Musterverläufe; also aggregates and creates visuals. Writes
+  - `Exports/Musterverlauf_Abweichung_Summary.csv`
+  - per-cluster overlays `…/kreis|zikzak/muster_compare.png`
+  - heatmap `Exports/Musterverlauf_Heatmap_nRMSE.png`
+  - boxplots `Exports/Musterverlauf_Boxplot_byTask.png`
+  - bar chart `Exports/Musterverlauf_Bar_Combined.png`
+- `Step10_aggregate_percent_table.py` -> aggregates the summary into a cluster→percentage table; writes
+  - `Exports/Musterverlauf_Abweichung_PercentTable.csv`
+  - `Exports/Musterverlauf_Abweichung_PercentTable_detailed.csv`
+  - `Exports/Musterverlauf_Total_Abweichung.txt`
+
+Directory with references and tools for Musterverläufe:
+- `AbweichungsReferenzen/` — pattern definitions and helpers used in Step 10
+  - `Kreis.csv`, `ZickZack.csv` (base shapes)
+  - `create_musterverlauf.py` (builds `Musterverlauf_Kreis.csv`, `Musterverlauf_ZickZack.csv`)
+  - `animate_musterverlauf.py` (visual sanity-check/animation)
+  - `Musterverlauf_Kreis.csv`, `Musterverlauf_ZickZack.csv` (generated references)
+
 Notes:
 - `data_clean_v1.py` exists but is not part of the official pipeline described below.
 - Zipped raw acquisitions under `Exports/Probant*/...` are not consumed directly by these steps; the pipeline expects CSVs under `Exports/Daten_Raw/`.
@@ -131,7 +149,15 @@ Notes:
 - Purpose: Builds demographic clusters (by gender, age-within-gender, and age only) using a `probanten_dict` mapping from probant number to metadata; averages within each cluster and experiment and plots scalar kinematics.
 - Output: `Exports/Clustered/<Mode>/<Cluster>/<Experiment>/{mean.csv, velocity_acc_scalar.png}`.
 
-11) 3D Trajectory Visualization (ad-hoc)
+11) Step 10 — Musterverlauf Analysis + Percent Table + Visuals
+- Files: `Step10_musterverlauf_analysis.py` (analysis + aggregation + visuals), `Step10_aggregate_percent_table.py` (optional re-aggregation)
+- Purpose: Compare averaged trajectories (XY only, time-agnostic) against predefined Musterverläufe, produce a compact cluster→percentage report, and generate overview plots.
+- Alignment:
+  - kreis: translate observed center to reference center and evaluate radial deviation; report radial nRMSE% as primary metric.
+  - zikzak: translate to anchor point 2 (start), then compare shapes via arc-length resampling (no time relation).
+- Outputs: summary CSV, percent tables, totals, heatmap, boxplots, bar chart, and overlay plots in each cluster folder.
+
+12) 3D Trajectory Visualization (ad-hoc)
 - File: `visualize_marker_trajectories.py`
 - Purpose: Loads any CSV with `m_X/m_Y/m_Z` columns, removes invalid rows, and animates markers in 3D using `matplotlib.animation`.
 - Usage: `python visualize_marker_trajectories.py <path/to/csv>`
@@ -182,6 +208,13 @@ python Step8_plots.py
 python Step9_Segmentation.py
 ```
 
+11. Musterverlauf analysis + percent table + visuals
+```
+python Step10_musterverlauf_analysis.py
+```
+   - Uses references in `AbweichungsReferenzen/`.
+   - Optionally rebuild tables only: `python Step10_aggregate_percent_table.py`
+
 You can re-run any single step after tuning its parameters; downstream steps will read the updated outputs.
 
 
@@ -220,6 +253,14 @@ You can re-run any single step after tuning its parameters; downstream steps wil
 - `Exports/Final_Cleaned/`: smoothed final CSVs.
 - `Exports/Plots/`: scalar |v|/|a| plots per experiment.
 - `Exports/Clustered/...`: cluster-level means and plots.
+- `Exports/Musterverlauf_Abweichung_Summary.csv`: per-cluster deviation metrics vs. Musterverlauf.
+- `Exports/Musterverlauf_Abweichung_PercentTable.csv`: cluster → percentage (combined mean nRMSE%).
+- `Exports/Musterverlauf_Abweichung_PercentTable_detailed.csv`: per-cluster kreis/zikzak percentages.
+- `Exports/Musterverlauf_Total_Abweichung.txt`: overall totals.
+- `…/kreis|zikzak/muster_compare.png`: overlay of averaged path vs. Musterverlauf in each cluster folder.
+ - `Exports/Musterverlauf_Heatmap_nRMSE.png`: heatmap of nRMSE% by cluster × task.
+ - `Exports/Musterverlauf_Boxplot_byTask.png`: boxplots of cluster nRMSE% grouped by task.
+ - `Exports/Musterverlauf_Bar_Combined.png`: bar chart of combined mean nRMSE% per cluster.
 
 
 ## Re-running on New Data
@@ -246,6 +287,4 @@ This code follows established biomechanical signal-processing practice:
 - Smooth positions first, then differentiate (Savitzky-Golay) to preserve peak timing and reduce noise amplification.
 - Use robust guards (Hampel) to suppress spikes before smoothing.
 - Normalize and resample for averaging across trials and participants.
-
-If you have questions or want to automate the whole chain, consider adding a simple `run_all.py` that calls each step in order with your preferred parameters.
 

@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
+from scipy.signal import butter, filtfilt
 
 
 # --- CONFIG ---
@@ -29,12 +30,12 @@ HAMPEL_SIGMAS = 3.0
 # Emphasis to suppress smaller bumps (post-processing on magnitudes)
 # Apply strong, adaptive smoothing to velocity/acceleration magnitudes
 EMPHASIZE_VELOCITY = True
-EMPHASIZE_ACCELERATION = False
+EMPHASIZE_ACCELERATION = True
 
 # Fraction of series length used to adapt the smoothing window
 # e.g., 0.33 -> window ≈ 33% of series length (capped to valid odd length)
 PEAK_V_WINDOW_FRAC = 0.33
-PEAK_A_WINDOW_FRAC = None
+PEAK_A_WINDOW_FRAC = 0.25
 
 # Minimum/base windows (will be increased by *_FRAC if that yields larger window)
 PEAK_V_WINDOW = 41
@@ -46,10 +47,30 @@ PEAK_POLY = 2
 # Keep the original peak height after emphasis smoothing
 PEAK_RESCALE_TO_MAX = True
 
+# --- Units & Time Base ---
+# Provide a column with absolute time in seconds (e.g., "Time" or "Timestamp"). If None, fallback logic applies.
+TIME_COLUMN: str | None = None  # e.g., "Time"
+# If no TIME_COLUMN, you can supply a known sample rate (Hz). If None, fallback to using the existing 'Frame' column (percent progress).
+SAMPLE_RATE_HZ: float | None = 200.0
+# Choose how the x-axis should be displayed in plots: "percent" (0..100), "seconds" (0-based), or "frames" (0-based)
+TIME_AXIS_MODE: str = "percent"
+
+# Specify position units if known: "mm", "m", or None (unknown/a.u.).
+POSITION_UNIT: str | None = "m"
+# If POSITION_UNIT == "mm" and you want SI units, set this true to convert to meters.
+CONVERT_POSITION_TO_METERS: bool = False
+
+# Optional zero-phase low-pass for magnitudes to suppress noise strongly
+USE_BUTTER_SMOOTH = True
+BUTTER_ORDER = 4
+VEL_CUTOFF_HZ = 6.0
+ACC_CUTOFF_HZ = 8.0
+
 
 # --- Setup ---
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 files = glob(f"{INPUT_DIR}/*_final_clean.csv")
+summary_rows = []  # collect per-aufgabe velocity stats
 
 
 def _ensure_odd(n: int, *, min_val: int = 5) -> int:
@@ -104,20 +125,17 @@ def _infer_markers(columns) -> list[int]:
     return sorted(ids)
 
 
-def compute_scalar_velocity_and_acceleration(df: pd.DataFrame, marker_id: int):
+def compute_scalar_velocity_and_acceleration(df: pd.DataFrame, marker_id: int, dt: float, pos_scale: float = 1.0):
     """
     Returns smoothed ||v|| and ||a|| for a given marker using SG smoothing + SG derivatives.
-    Time base in percent (0..100), used only to scale derivatives via delta.
+    dt: time step in seconds (or chosen time unit). pos_scale scales positions into desired units (e.g., mm->m).
     """
-    t = df["Frame"].astype(float).values
-    dt = float(np.mean(np.diff(t))) if len(t) > 1 else 1.0
-
     pos_axes = {}
     for axis in AXES:
         col = f"{marker_id}_{axis}"
         if col not in df.columns:
             return None, None
-        x = df[col].astype(float).values
+        x = df[col].astype(float).values * float(pos_scale)
         # Outlier guard
         if HAMPEL_WINDOW > 0:
             x = _hampel(x, k=HAMPEL_WINDOW, n_sigmas=HAMPEL_SIGMAS)
@@ -137,11 +155,30 @@ def compute_scalar_velocity_and_acceleration(df: pd.DataFrame, marker_id: int):
     vel_norm = np.sqrt(vx**2 + vy**2 + vz**2)
     acc_norm = np.sqrt(ax**2 + ay**2 + az**2)
 
-    # Light final smoothing on magnitudes to suppress residual ripples (keep peak shape)
-    w_vmag = _cap_window(9, len(vel_norm), min_val=5)
-    w_amag = _cap_window(15, len(acc_norm), min_val=5)
-    vel_smooth = savgol_filter(vel_norm, window_length=w_vmag, polyorder=2, mode="interp")
-    acc_smooth = savgol_filter(acc_norm, window_length=w_amag, polyorder=2, mode="interp")
+    # Final smoothing on magnitudes
+    if USE_BUTTER_SMOOTH and dt > 0 and np.isfinite(dt):
+        fs = 1.0 / dt
+        try:
+            # Velocity
+            wc_v = min(max(VEL_CUTOFF_HZ / (0.5 * fs), 1e-4), 0.99)
+            b_v, a_v = butter(BUTTER_ORDER, wc_v, btype="low")
+            vel_smooth = filtfilt(b_v, a_v, vel_norm, method="gust")
+            # Acceleration
+            wc_a = min(max(ACC_CUTOFF_HZ / (0.5 * fs), 1e-4), 0.99)
+            b_a, a_a = butter(BUTTER_ORDER, wc_a, btype="low")
+            acc_smooth = filtfilt(b_a, a_a, acc_norm, method="gust")
+        except Exception:
+            # Fallback to Savitzky–Golay if butter fails
+            w_vmag = _cap_window(9, len(vel_norm), min_val=5)
+            w_amag = _cap_window(31, len(acc_norm), min_val=5)
+            vel_smooth = savgol_filter(vel_norm, window_length=w_vmag, polyorder=2, mode="interp")
+            acc_smooth = savgol_filter(acc_norm, window_length=w_amag, polyorder=2, mode="interp")
+    else:
+        # Savitzky–Golay fallback/option
+        w_vmag = _cap_window(9, len(vel_norm), min_val=5)
+        w_amag = _cap_window(31, len(acc_norm), min_val=5)
+        vel_smooth = savgol_filter(vel_norm, window_length=w_vmag, polyorder=2, mode="interp")
+        acc_smooth = savgol_filter(acc_norm, window_length=w_amag, polyorder=2, mode="interp")
 
     return vel_smooth, acc_smooth
 
@@ -220,6 +257,31 @@ for path in files:
     try:
         df = pd.read_csv(path, delimiter=DELIMITER)
 
+        # --- Determine time base and dt ---
+        use_seconds = False
+        t_seconds = None
+        dt = 1.0
+        if TIME_COLUMN and TIME_COLUMN in df.columns:
+            t_seconds = df[TIME_COLUMN].astype(float).values
+            if len(t_seconds) > 1:
+                dt = float(np.mean(np.diff(t_seconds)))
+            use_seconds = True
+        elif SAMPLE_RATE_HZ is not None:
+            try:
+                sr = float(SAMPLE_RATE_HZ)
+            except Exception:
+                sr = None
+            if sr and np.isfinite(sr) and sr > 0:
+                t_seconds = np.arange(len(df), dtype=float) / sr
+                dt = 1.0 / sr
+                use_seconds = True
+        else:
+            # Fallback to percent-based Frame spacing (original behavior)
+            if "Frame" in df.columns:
+                t_percent = df["Frame"].astype(float).values
+                if len(t_percent) > 1:
+                    dt = float(np.mean(np.diff(t_percent)))
+
         # Infer marker IDs if not provided
         markers_to_use = MARKERS or _infer_markers(df.columns)
         if not markers_to_use:
@@ -228,8 +290,22 @@ for path in files:
         # Compute v,a for all markers first
         per_marker = {}
         v_stack = []
+        # Position scaling only for physical seconds to avoid units like m/%
+        pos_scale = 1.0
+        pos_unit_out = "a.u."
+        if use_seconds:
+            if POSITION_UNIT == "mm":
+                if CONVERT_POSITION_TO_METERS:
+                    pos_scale = 1e-3
+                    pos_unit_out = "m"
+                else:
+                    pos_scale = 1.0
+                    pos_unit_out = "mm"
+            elif POSITION_UNIT == "m":
+                pos_scale = 1.0
+                pos_unit_out = "m"
         for marker_id in markers_to_use:
-            v, a = compute_scalar_velocity_and_acceleration(df, marker_id)
+            v, a = compute_scalar_velocity_and_acceleration(df, marker_id, dt=dt, pos_scale=pos_scale)
             if v is None or a is None:
                 continue
             per_marker[marker_id] = (v, a)
@@ -239,7 +315,9 @@ for path in files:
             raise ValueError("No valid marker velocities computed")
 
         v_stack = np.vstack(v_stack)
-        v_ref = np.median(v_stack, axis=0)
+        # Reference velocity as median across markers (unemphasized)
+        v_ref_raw = np.median(v_stack, axis=0)
+        v_ref = v_ref_raw.copy()
 
         # OPTIONAL: Apply emphasis on the reference velocity before segment detection
         if EMPHASIZE_VELOCITY:
@@ -254,10 +332,47 @@ for path in files:
         # Detect main movement segment via hysteresis thresholds
         s, e = _find_main_segment(v_ref, enter_frac=0.05, exit_frac=0.03, min_len_frac=0.1)
 
-        # Time handling: slice to segment and re-normalize to 0..100 for plotting
-        time_full = df["Frame"].astype(float).values
-        time_seg = time_full[s:e + 1]
-        time_pct = _renormalize_percent(time_seg)
+        # Time handling for plotting axis
+        if TIME_AXIS_MODE.lower() == "seconds" and use_seconds and t_seconds is not None:
+            x_plot = t_seconds[s:e + 1] - t_seconds[s]
+            xlabel = "Zeit (s)"
+        elif TIME_AXIS_MODE.lower() == "frames":
+            x_plot = np.arange(e - s + 1, dtype=float)
+            xlabel = "Frames"
+        else:
+            # percent progression (0..100) using best available base
+            if use_seconds and t_seconds is not None:
+                t_base = t_seconds
+            else:
+                t_base = df["Frame"].astype(float).values if "Frame" in df.columns else np.arange(len(df), dtype=float)
+            time_seg = t_base[s:e + 1]
+            x_plot = _renormalize_percent(time_seg)
+            xlabel = "Bewegungsfortschritt (%)"
+
+        # Compute summary stats (max/median) on the unemphasized reference within segment
+        v_seg = v_ref_raw[s:e + 1]
+        max_vel = float(np.max(v_seg)) if len(v_seg) > 0 else float("nan")
+        median_vel = float(np.median(v_seg)) if len(v_seg) > 0 else float("nan")
+        # Percent-of-segment at which peak occurs (0..100)
+        if use_seconds and t_seconds is not None:
+            t_base = t_seconds
+        else:
+            t_base = df["Frame"].astype(float).values if "Frame" in df.columns else np.arange(len(df), dtype=float)
+        seg_time = t_base[s:e + 1]
+        seg_pct = _renormalize_percent(seg_time)
+        if len(v_seg) > 0:
+            peak_local_idx = int(np.argmax(v_seg))
+            peak_pct = float(seg_pct[peak_local_idx])
+        else:
+            peak_pct = float("nan")
+        vel_units_here = (f"{pos_unit_out}/s" if use_seconds else "a.u./%")
+        summary_rows.append({
+            "Aufgabe": name,
+            "MaxVelocity": max_vel,
+            "MedianVelocity": median_vel,
+            "VelocityUnits": vel_units_here,
+            "PeakVelocityPercent": peak_pct,
+        })
 
         fig, (ax_v, ax_a) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
         fig.suptitle(f"{name} | Betrag von Geschwindigkeit und Beschleunigung", fontsize=14)
@@ -281,14 +396,22 @@ for path in files:
                     frac=PEAK_A_WINDOW_FRAC,
                 )
 
-            ax_v.plot(time_pct, v[s:e + 1], label=f"Marker {marker_id}", linewidth=1.4)
-            ax_a.plot(time_pct, a[s:e + 1], label=f"Marker {marker_id}", linewidth=1.2)
+            ax_v.plot(x_plot, v[s:e + 1], label=f"Marker {marker_id}", linewidth=1.4)
+            ax_a.plot(x_plot, a[s:e + 1], label=f"Marker {marker_id}", linewidth=1.2)
+
+        # Units for y-axis labels
+        if use_seconds:
+            vel_units = f"{pos_unit_out}/s"
+            acc_units = f"{pos_unit_out}/s²"
+        else:
+            vel_units = "a.u./%"
+            acc_units = "a.u./%²"
 
         ax_v.set_title("Geschwindigkeit (||v||)")
         ax_a.set_title("Beschleunigung (||a||)")
-        ax_a.set_xlabel("Bewegungsfortschritt (%)")
-        ax_v.set_ylabel("||v|| [a.u./%]")
-        ax_a.set_ylabel("||a|| [a.u./%²]")
+        ax_a.set_xlabel(xlabel)
+        ax_v.set_ylabel(f"||v|| [{vel_units}]")
+        ax_a.set_ylabel(f"||a|| [{acc_units}]")
         ax_v.grid(True, alpha=0.2)
         ax_a.grid(True, alpha=0.2)
         ax_v.legend()
@@ -299,6 +422,38 @@ for path in files:
         fig.savefig(out_path, dpi=160)
         plt.close(fig)
         print(f"Saved plot: {out_path}")
+        print(f"Summary for {name}: max_v={max_vel:.3f} {vel_units_here} @ {peak_pct:.1f}%, median_v={median_vel:.3f} {vel_units_here}")
+
+        # --- Velocity-only plot ---
+        fig_vo, ax_vo = plt.subplots(1, 1, figsize=(10, 4))
+        for marker_id, (v, _a) in per_marker.items():
+            # Apply optional emphasis as in the main plot
+            if EMPHASIZE_VELOCITY:
+                v = _emphasize_peak(
+                    v,
+                    base_window=PEAK_V_WINDOW,
+                    poly=PEAK_POLY,
+                    rescale_to_max=PEAK_RESCALE_TO_MAX,
+                    frac=PEAK_V_WINDOW_FRAC,
+                )
+            ax_vo.plot(x_plot, v[s:e + 1], label=f"Marker {marker_id}", linewidth=1.4)
+        ax_vo.set_title("Geschwindigkeit (||v||)")
+        ax_vo.set_xlabel(xlabel)
+        ax_vo.set_ylabel(f"||v|| [{vel_units}]")
+        ax_vo.grid(True, alpha=0.2)
+        ax_vo.legend()
+        fig_vo.tight_layout()
+        out_vo_path = os.path.join(OUTPUT_DIR, f"{name}_velocity_scalar.png")
+        fig_vo.savefig(out_vo_path, dpi=160)
+        plt.close(fig_vo)
+        print(f"Saved velocity-only plot: {out_vo_path}")
 
     except Exception as e:
         print(f"Failed for {name}: {e}")
+
+# Write summary CSV for all Aufgaben
+if summary_rows:
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(OUTPUT_DIR, "velocity_summary.csv")
+    summary_df.to_csv(summary_path, index=False, sep=DELIMITER)
+    print(f"\nSaved velocity summary: {summary_path}")

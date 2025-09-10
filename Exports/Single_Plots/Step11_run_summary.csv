@@ -1,0 +1,5 @@
+Group;SourcePath;SamplesUsed;PeakTime_s;MaxVelocity;VelocityUnits
+ptp2;Exports/Daten_Raw_Clean\PTP\Probant4_PTP202_PTP202.csv;346;0.3450000000000001;0.6660156297884178;m/s
+präzision;Exports/Daten_Raw_Clean\Präzision\Probant10_Präzision20_Präzision20.csv;467;0.33499999999999996;0.5929139420573021;m/s
+zikzak;Exports/Daten_Raw_Clean\Zikzak\Probant10_Zikzak11_Zikzak11.csv;615;0.28;0.9301027410404278;m/s
+gewicht;Exports/Daten_Raw_Clean\Gewicht\Probant10_Gewicht13_Gewicht13.csv;308;0.35;0.9575097391348437;m/s

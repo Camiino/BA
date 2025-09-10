@@ -30,7 +30,7 @@ HAMPEL_SIGMAS = 3.0
 # Emphasis to suppress smaller bumps (post-processing on magnitudes)
 # Apply strong, adaptive smoothing to velocity/acceleration magnitudes
 EMPHASIZE_VELOCITY = True
-EMPHASIZE_ACCELERATION = True
+EMPHASIZE_ACCELERATION = False
 
 # Fraction of series length used to adapt the smoothing window
 # e.g., 0.33 -> window ≈ 33% of series length (capped to valid odd length)
@@ -48,16 +48,11 @@ PEAK_POLY = 2
 PEAK_RESCALE_TO_MAX = True
 
 # --- Units & Time Base ---
-# Provide a column with absolute time in seconds (e.g., "Time" or "Timestamp"). If None, fallback logic applies.
 TIME_COLUMN: str | None = None  # e.g., "Time"
-# If no TIME_COLUMN, you can supply a known sample rate (Hz). If None, fallback to using the existing 'Frame' column (percent progress).
 SAMPLE_RATE_HZ: float | None = 200.0
-# Choose how the x-axis should be displayed in plots: "percent" (0..100), "seconds" (0-based), or "frames" (0-based)
 TIME_AXIS_MODE: str = "percent"
 
-# Specify position units if known: "mm", "m", or None (unknown/a.u.).
 POSITION_UNIT: str | None = "m"
-# If POSITION_UNIT == "mm" and you want SI units, set this true to convert to meters.
 CONVERT_POSITION_TO_METERS: bool = False
 
 # Optional zero-phase low-pass for magnitudes to suppress noise strongly
@@ -70,7 +65,7 @@ ACC_CUTOFF_HZ = 8.0
 # --- Setup ---
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 files = glob(f"{INPUT_DIR}/*_final_clean.csv")
-summary_rows = []  # collect per-aufgabe velocity stats
+summary_rows = []  # collect per-aufgabe velocity + acceleration stats
 
 
 def _ensure_odd(n: int, *, min_val: int = 5) -> int:
@@ -81,7 +76,6 @@ def _ensure_odd(n: int, *, min_val: int = 5) -> int:
 def _cap_window(target: int, series_len: int, *, min_val: int = 5) -> int:
     if series_len <= 1:
         return _ensure_odd(min_val)
-    # keep below length and odd
     max_allowed = series_len - 1 if series_len % 2 == 0 else series_len
     return _ensure_odd(min(target, max_allowed), min_val=min_val)
 
@@ -127,22 +121,19 @@ def _infer_markers(columns) -> list[int]:
 
 def compute_scalar_velocity_and_acceleration(df: pd.DataFrame, marker_id: int, dt: float, pos_scale: float = 1.0):
     """
-    Returns smoothed ||v|| and ||a|| for a given marker using SG smoothing + SG derivatives.
-    dt: time step in seconds (or chosen time unit). pos_scale scales positions into desired units (e.g., mm->m).
+    Compute smoothed ||v||, ||a|| and tangential acceleration a_tang = d||v||/dt for a marker.
+    Returns: (vel_smooth, acc_smooth, a_tang)
     """
     pos_axes = {}
     for axis in AXES:
         col = f"{marker_id}_{axis}"
         if col not in df.columns:
-            return None, None
+            return None, None, None
         x = df[col].astype(float).values * float(pos_scale)
-        # Outlier guard
         if HAMPEL_WINDOW > 0:
             x = _hampel(x, k=HAMPEL_WINDOW, n_sigmas=HAMPEL_SIGMAS)
-        # Smooth positions first
         w_pos = _cap_window(SG_WINDOW_POS, len(x), min_val=SG_POLY_POS + 2)
         x_s = savgol_filter(x, window_length=w_pos, polyorder=SG_POLY_POS, mode="interp")
-        # Derivatives via Savitzky–Golay
         w_der = _cap_window(SG_WINDOW_DER, len(x_s), min_val=SG_POLY_POS + 2)
         v = savgol_filter(x_s, window_length=w_der, polyorder=SG_POLY_POS, deriv=1, delta=dt, mode="interp")
         a = savgol_filter(x_s, window_length=w_der, polyorder=SG_POLY_POS, deriv=2, delta=dt, mode="interp")
@@ -154,33 +145,31 @@ def compute_scalar_velocity_and_acceleration(df: pd.DataFrame, marker_id: int, d
 
     vel_norm = np.sqrt(vx**2 + vy**2 + vz**2)
     acc_norm = np.sqrt(ax**2 + ay**2 + az**2)
+    a_tang = savgol_filter(vel_norm, window_length=_cap_window(SG_WINDOW_DER, len(vel_norm), min_val=SG_POLY_POS + 2),
+                           polyorder=SG_POLY_POS, deriv=1, delta=dt, mode="interp")
 
-    # Final smoothing on magnitudes
     if USE_BUTTER_SMOOTH and dt > 0 and np.isfinite(dt):
         fs = 1.0 / dt
         try:
-            # Velocity
             wc_v = min(max(VEL_CUTOFF_HZ / (0.5 * fs), 1e-4), 0.99)
             b_v, a_v = butter(BUTTER_ORDER, wc_v, btype="low")
             vel_smooth = filtfilt(b_v, a_v, vel_norm, method="gust")
-            # Acceleration
+
             wc_a = min(max(ACC_CUTOFF_HZ / (0.5 * fs), 1e-4), 0.99)
             b_a, a_a = butter(BUTTER_ORDER, wc_a, btype="low")
             acc_smooth = filtfilt(b_a, a_a, acc_norm, method="gust")
         except Exception:
-            # Fallback to Savitzky–Golay if butter fails
             w_vmag = _cap_window(9, len(vel_norm), min_val=5)
             w_amag = _cap_window(31, len(acc_norm), min_val=5)
             vel_smooth = savgol_filter(vel_norm, window_length=w_vmag, polyorder=2, mode="interp")
             acc_smooth = savgol_filter(acc_norm, window_length=w_amag, polyorder=2, mode="interp")
     else:
-        # Savitzky–Golay fallback/option
         w_vmag = _cap_window(9, len(vel_norm), min_val=5)
         w_amag = _cap_window(31, len(acc_norm), min_val=5)
         vel_smooth = savgol_filter(vel_norm, window_length=w_vmag, polyorder=2, mode="interp")
         acc_smooth = savgol_filter(acc_norm, window_length=w_amag, polyorder=2, mode="interp")
 
-    return vel_smooth, acc_smooth
+    return vel_smooth, acc_smooth, a_tang
 
 
 def _find_main_segment(v_ref: np.ndarray, enter_frac: float = 0.05, exit_frac: float = 0.03, min_len_frac: float = 0.1):
@@ -193,13 +182,11 @@ def _find_main_segment(v_ref: np.ndarray, enter_frac: float = 0.05, exit_frac: f
     thr_enter = enter_frac * peak
     thr_exit = exit_frac * peak
 
-    # Hysteresis base mask on exit threshold
     mask = v_ref > thr_exit
     idx = np.where(mask)[0]
     if idx.size == 0:
         return 0, n - 1
 
-    # Split into contiguous segments
     cuts = np.where(np.diff(idx) > 1)[0]
     segments = []
     start = 0
@@ -208,7 +195,6 @@ def _find_main_segment(v_ref: np.ndarray, enter_frac: float = 0.05, exit_frac: f
         start = c + 1
     segments.append((idx[start], idx[-1]))
 
-    # Choose segment containing global peak
     peak_i = int(np.argmax(v_ref))
     chosen = None
     for s, e in segments:
@@ -216,11 +202,9 @@ def _find_main_segment(v_ref: np.ndarray, enter_frac: float = 0.05, exit_frac: f
             chosen = (s, e)
             break
     if chosen is None:
-        # fallback: longest segment
         chosen = max(segments, key=lambda se: se[1] - se[0])
 
     s, e = chosen
-    # Expand to enter threshold crossings (hysteresis)
     i = s
     while i > 0 and v_ref[i - 1] >= thr_enter:
         i -= 1
@@ -230,7 +214,6 @@ def _find_main_segment(v_ref: np.ndarray, enter_frac: float = 0.05, exit_frac: f
         j += 1
     e = j
 
-    # Ensure minimum duration
     min_len = max(5, int(min_len_frac * n))
     if (e - s + 1) < min_len:
         half = (min_len - (e - s + 1)) // 2
@@ -276,7 +259,6 @@ for path in files:
                 dt = 1.0 / sr
                 use_seconds = True
         else:
-            # Fallback to percent-based Frame spacing (original behavior)
             if "Frame" in df.columns:
                 t_percent = df["Frame"].astype(float).values
                 if len(t_percent) > 1:
@@ -290,7 +272,7 @@ for path in files:
         # Compute v,a for all markers first
         per_marker = {}
         v_stack = []
-        # Position scaling only for physical seconds to avoid units like m/%
+        a_tang_stack = []
         pos_scale = 1.0
         pos_unit_out = "a.u."
         if use_seconds:
@@ -304,20 +286,27 @@ for path in files:
             elif POSITION_UNIT == "m":
                 pos_scale = 1.0
                 pos_unit_out = "m"
+
         for marker_id in markers_to_use:
-            v, a = compute_scalar_velocity_and_acceleration(df, marker_id, dt=dt, pos_scale=pos_scale)
-            if v is None or a is None:
+            v, a, a_tang = compute_scalar_velocity_and_acceleration(df, marker_id, dt=dt, pos_scale=pos_scale)
+            if v is None or a is None or a_tang is None:
                 continue
-            per_marker[marker_id] = (v, a)
+            per_marker[marker_id] = (v, a, a_tang)
             v_stack.append(v)
+            a_tang_stack.append(a_tang)
 
         if not per_marker:
             raise ValueError("No valid marker velocities computed")
 
         v_stack = np.vstack(v_stack)
+        a_tang_stack = np.vstack(a_tang_stack)
+
         # Reference velocity as median across markers (unemphasized)
         v_ref_raw = np.median(v_stack, axis=0)
         v_ref = v_ref_raw.copy()
+
+        # Median tangential acceleration across markers for peak detection
+        a_tang_ref_raw = np.median(a_tang_stack, axis=0)
 
         # OPTIONAL: Apply emphasis on the reference velocity before segment detection
         if EMPHASIZE_VELOCITY:
@@ -329,7 +318,7 @@ for path in files:
                 frac=PEAK_V_WINDOW_FRAC,
             )
 
-        # Detect main movement segment via hysteresis thresholds
+        # Detect main movement segment via hysteresis thresholds on velocity
         s, e = _find_main_segment(v_ref, enter_frac=0.05, exit_frac=0.03, min_len_frac=0.1)
 
         # Time handling for plotting axis
@@ -340,7 +329,6 @@ for path in files:
             x_plot = np.arange(e - s + 1, dtype=float)
             xlabel = "Frames"
         else:
-            # percent progression (0..100) using best available base
             if use_seconds and t_seconds is not None:
                 t_base = t_seconds
             else:
@@ -349,11 +337,11 @@ for path in files:
             x_plot = _renormalize_percent(time_seg)
             xlabel = "Bewegungsfortschritt (%)"
 
-        # Compute summary stats (max/median) on the unemphasized reference within segment
+        # --- Velocity scalar stats (within segment, on UNemphasized ref) ---
         v_seg = v_ref_raw[s:e + 1]
         max_vel = float(np.max(v_seg)) if len(v_seg) > 0 else float("nan")
         median_vel = float(np.median(v_seg)) if len(v_seg) > 0 else float("nan")
-        # Percent-of-segment at which peak occurs (0..100)
+
         if use_seconds and t_seconds is not None:
             t_base = t_seconds
         else:
@@ -365,41 +353,52 @@ for path in files:
             peak_pct = float(seg_pct[peak_local_idx])
         else:
             peak_pct = float("nan")
+
+        # --- Tangential acceleration peak stats (within the same segment) ---
+        a_tang_seg = a_tang_ref_raw[s:e + 1]
+        if len(a_tang_seg) > 0:
+            pos_idx = int(np.argmax(a_tang_seg))
+            neg_idx = int(np.argmin(a_tang_seg))
+            pos_accel_peak = float(a_tang_seg[pos_idx])
+            neg_accel_peak = float(a_tang_seg[neg_idx])
+            pos_accel_pct = float(seg_pct[pos_idx])
+            neg_accel_pct = float(seg_pct[neg_idx])
+        else:
+            pos_accel_peak = float("nan")
+            neg_accel_peak = float("nan")
+            pos_accel_pct = float("nan")
+            neg_accel_pct = float("nan")
+
         vel_units_here = (f"{pos_unit_out}/s" if use_seconds else "a.u./%")
+        acc_units_here = (f"{pos_unit_out}/s²" if use_seconds else "a.u./%²")
+
         summary_rows.append({
             "Aufgabe": name,
             "MaxVelocity": max_vel,
             "MedianVelocity": median_vel,
             "VelocityUnits": vel_units_here,
             "PeakVelocityPercent": peak_pct,
+            "PosAccelPeak": pos_accel_peak,
+            "NegAccelPeak": neg_accel_peak,
+            "AccelUnits": acc_units_here,
+            "PosAccelPeakPercent": pos_accel_pct,
+            "NegAccelPeakPercent": neg_accel_pct,
         })
 
+        # --- Plotting ---
         fig, (ax_v, ax_a) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
         fig.suptitle(f"{name} | Betrag von Geschwindigkeit und Beschleunigung", fontsize=14)
 
-        for marker_id, (v, a) in per_marker.items():
-            # OPTIONAL: Emphasize individual curves for display
+        trim = max(1, int(0.01 * (e - s + 1)))  # 1 % Rand weg
+        sl = slice(s + trim, e + 1 - trim)
+
+        for marker_id, (v, a, a_tang) in per_marker.items():
             if EMPHASIZE_VELOCITY:
-                v = _emphasize_peak(
-                    v,
-                    base_window=PEAK_V_WINDOW,
-                    poly=PEAK_POLY,
-                    rescale_to_max=PEAK_RESCALE_TO_MAX,
-                    frac=PEAK_V_WINDOW_FRAC,
-                )
-            if EMPHASIZE_ACCELERATION:
-                a = _emphasize_peak(
-                    a,
-                    base_window=PEAK_A_WINDOW,
-                    poly=PEAK_POLY,
-                    rescale_to_max=PEAK_RESCALE_TO_MAX,
-                    frac=PEAK_A_WINDOW_FRAC,
-                )
+                v = _emphasize_peak(v, base_window=PEAK_V_WINDOW, poly=PEAK_POLY,
+                                    rescale_to_max=PEAK_RESCALE_TO_MAX, frac=PEAK_V_WINDOW_FRAC)
+            ax_v.plot(x_plot[trim:-trim] if trim > 0 else x_plot, v[sl], label=f"Marker {marker_id}", linewidth=1.4)
+            ax_a.plot(x_plot[trim:-trim] if trim > 0 else x_plot, a_tang[sl], label=f"Marker {marker_id}", linewidth=1.2)
 
-            ax_v.plot(x_plot, v[s:e + 1], label=f"Marker {marker_id}", linewidth=1.4)
-            ax_a.plot(x_plot, a[s:e + 1], label=f"Marker {marker_id}", linewidth=1.2)
-
-        # Units for y-axis labels
         if use_seconds:
             vel_units = f"{pos_unit_out}/s"
             acc_units = f"{pos_unit_out}/s²"
@@ -408,10 +407,10 @@ for path in files:
             acc_units = "a.u./%²"
 
         ax_v.set_title("Geschwindigkeit (||v||)")
-        ax_a.set_title("Beschleunigung (||a||)")
+        ax_a.set_title("Tangentiale Beschleunigung (d||v||/dt)")
         ax_a.set_xlabel(xlabel)
         ax_v.set_ylabel(f"||v|| [{vel_units}]")
-        ax_a.set_ylabel(f"||a|| [{acc_units}]")
+        ax_a.set_ylabel(f"a_tang [{acc_units}]")
         ax_v.grid(True, alpha=0.2)
         ax_a.grid(True, alpha=0.2)
         ax_v.legend()
@@ -422,12 +421,16 @@ for path in files:
         fig.savefig(out_path, dpi=160)
         plt.close(fig)
         print(f"Saved plot: {out_path}")
-        print(f"Summary for {name}: max_v={max_vel:.3f} {vel_units_here} @ {peak_pct:.1f}%, median_v={median_vel:.3f} {vel_units_here}")
+        print(
+            f"Summary for {name}: max_v={max_vel:.3f} {vel_units_here} @ {peak_pct:.1f}%, "
+            f"median_v={median_vel:.3f} {vel_units_here}, "
+            f"pos_a={pos_accel_peak:.3f} {acc_units_here} @ {pos_accel_pct:.1f}%, "
+            f"neg_a={neg_accel_peak:.3f} {acc_units_here} @ {neg_accel_pct:.1f}%"
+        )
 
         # --- Velocity-only plot ---
         fig_vo, ax_vo = plt.subplots(1, 1, figsize=(10, 4))
-        for marker_id, (v, _a) in per_marker.items():
-            # Apply optional emphasis as in the main plot
+        for marker_id, (v, _a, _a_tang) in per_marker.items():
             if EMPHASIZE_VELOCITY:
                 v = _emphasize_peak(
                     v,

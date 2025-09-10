@@ -53,6 +53,8 @@ Key scripts and their outputs (in order of execution):
   - `Exports/Musterverlauf_Abweichung_PercentTable_detailed.csv`
   - `Exports/Musterverlauf_Total_Abweichung.txt`
 
+- `Step11_best_single_plots.py` -> selects the best single trial (no averaging) for `ptp`, `zikzak`, and `gewicht` and generates velocity/tangential-acceleration plots. Writes plots to `Exports/Single_Plots/` and the selected cleaned CSVs to `Exports/Single_Selected/`.
+
 Directory with references and tools for Musterverläufe:
 - `AbweichungsReferenzen/` — pattern definitions and helpers used in Step 10
   - `Kreis.csv`, `ZickZack.csv` (base shapes)
@@ -138,11 +140,11 @@ Notes:
 - Methods and rationale:
   - Robust pre-filtering with a Hampel-like outlier guard.
   - Position smoothing via Savitzky-Golay (`window=21`, `poly=3`).
-  - Derivatives via Savitzky-Golay (`deriv=1/2`) using the average `Frame` delta; avoids amplifying noise compared to naive finite differences while preserving peak timing.
-  - Light magnitude smoothing: velocity window 9, acceleration window 15 (`poly=2`).
+  - Derivatives via Savitzky-Golay (`deriv=1/2`) using a time base from `TIME_COLUMN` or `SAMPLE_RATE_HZ`; plots can use seconds, frames, or % progression.
+  - Optional zero‑phase Butterworth low‑pass on magnitudes (velocity/acceleration) for strong noise suppression (`VEL_CUTOFF_HZ`, `ACC_CUTOFF_HZ`).
   - Main-segment detection: hysteresis around the global |v| peak; defaults `enter=5%`, `exit=3%`, with a minimum duration of `10%` of the series; time is re-normalized to `0..100%` for the plot.
   - Optional dominant-peak emphasis for |v|: adaptive SG smoothing with `PEAK_V_WINDOW_FRAC` (e.g., 0.15–0.33) to suppress small ripples while preserving the main lobe height.
-- Output: `Exports/Plots/*_velocity_acc_scalar.png`.
+- Outputs: `Exports/Plots/*_velocity_acc_scalar.png`, `Exports/Plots/*_velocity_scalar.png`, and a compact `Exports/Plots/velocity_summary.csv`.
 
 10) Step 9 — Clustered Averages and Plots
 - File: `Step9_Segmentation.py`
@@ -161,6 +163,13 @@ Notes:
 - File: `visualize_marker_trajectories.py`
 - Purpose: Loads any CSV with `m_X/m_Y/m_Z` columns, removes invalid rows, and animates markers in 3D using `matplotlib.animation`.
 - Usage: `python visualize_marker_trajectories.py <path/to/csv>`
+
+13) Step 11 — Best Single-Trial Plots (no averaging)
+- File: `Step11_best_single_plots.py`
+- Purpose: For `ptp`, `zikzak`, and `gewicht`, automatically select one “best” recording directly from `Exports/Daten_Raw_Clean` (fewest gaps/extrapolation) and produce plots without averaging.
+- Selection scoring (heuristic): strong penalty for leading/trailing gaps (extrapolation), then internal gaps and number of gap segments; prefers longest contiguous valid span of the relevant marker (M1 for ptp/zikzak, M3 for gewicht).
+- Processing per selection: interpolate internal gaps, crop to valid span, Savitzky–Golay smoothing, compute |v| and tangential acceleration a_t = d|v|/dt (stable at low |v|), detect main segment, and plot.
+- Outputs: plots in `Exports/Single_Plots/` and the cropped/smoothed CSV in `Exports/Single_Selected/`.
 
 
 ## Running the Pipeline
@@ -215,6 +224,12 @@ python Step10_musterverlauf_analysis.py
    - Uses references in `AbweichungsReferenzen/`.
    - Optionally rebuild tables only: `python Step10_aggregate_percent_table.py`
 
+12. (Optional) Best single trial per task (no averaging)
+```
+python Step11_best_single_plots.py
+```
+   - Writes plots to `Exports/Single_Plots/` and the selected CSV to `Exports/Single_Selected/`.
+
 You can re-run any single step after tuning its parameters; downstream steps will read the updated outputs.
 
 
@@ -237,8 +252,13 @@ You can re-run any single step after tuning its parameters; downstream steps wil
 - Step 8 (`Step8_plots.py`):
   - Hampel filter: `HAMPEL_WINDOW`, `HAMPEL_SIGMAS`.
   - SG position/derivative windows: `SG_WINDOW_POS`, `SG_WINDOW_DER`, `SG_POLY_POS`.
+  - Time base & units: `TIME_COLUMN`, `SAMPLE_RATE_HZ`, `TIME_AXIS_MODE`, `POSITION_UNIT`, `CONVERT_POSITION_TO_METERS`.
+  - Optional magnitude low‑pass: `USE_BUTTER_SMOOTH`, `VEL_CUTOFF_HZ`, `ACC_CUTOFF_HZ`.
   - Segment detection: `_find_main_segment(enter_frac=0.05, exit_frac=0.03, min_len_frac=0.1)`.
   - Dominant-peak emphasis: `EMPHASIZE_VELOCITY`, `PEAK_V_WINDOW_FRAC` (e.g., 0.15–0.33), `PEAK_POLY`.
+
+- Step 11 (`Step11_best_single_plots.py`):
+  - Selection weights at top of script; kinematic params mirror Step 8.
 
 
 ## Expected Outputs
@@ -252,6 +272,8 @@ You can re-run any single step after tuning its parameters; downstream steps wil
 - `Exports/Final_Averages_1M/`: experiment-level means (Frame in `%`).
 - `Exports/Final_Cleaned/`: smoothed final CSVs.
 - `Exports/Plots/`: scalar |v|/|a| plots per experiment.
+- `Exports/Single_Plots/`: Single‑trial |v| and tangential acceleration plots + selection/run summaries.
+- `Exports/Single_Selected/`: Cropped and smoothed CSVs of the selected single trials.
 - `Exports/Clustered/...`: cluster-level means and plots.
 - `Exports/Musterverlauf_Abweichung_Summary.csv`: per-cluster deviation metrics vs. Musterverlauf.
 - `Exports/Musterverlauf_Abweichung_PercentTable.csv`: cluster → percentage (combined mean nRMSE%).
@@ -287,4 +309,3 @@ This code follows established biomechanical signal-processing practice:
 - Smooth positions first, then differentiate (Savitzky-Golay) to preserve peak timing and reduce noise amplification.
 - Use robust guards (Hampel) to suppress spikes before smoothing.
 - Normalize and resample for averaging across trials and participants.
-
